@@ -1,0 +1,20 @@
+google-genai>=2.30
+pyaudio
+aiohttp
+python-dotenv
+pyautogui
+pyperclip
+psutil
+mss
+pillow
+screen-brightness-control
+pycaw; sys_platform == "win32"
+comtypes; sys_platform == "win32"
+keyboard; sys_platform == "win32"
+# lite mode (local wake word, speech-to-text, voice)
+numpy
+openwakeword==0.4.0
+faster-whisper
+piper-tts
+edge-tts
+openai

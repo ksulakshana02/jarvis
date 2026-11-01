@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Assistant</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { --c: #3ef0ff; --dim: #4a6b78; --bg: #071419; --amber: #ffc457; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: radial-gradient(ellipse at 60% 50%, #0d2630 0%, var(--bg) 65%); color: var(--c);
+    font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace; overflow: hidden; user-select: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  .hud { position: fixed; pointer-events: none; }
+  #title { top: 22px; left: 26px; font-size: 15px; letter-spacing: 3px; text-shadow: 0 0 8px var(--c); }
+  #date { top: 46px; left: 26px; font-size: 12px; color: #9fdbe4; opacity: .85; }
+  #status { top: 22px; right: 28px; font-size: 12px; letter-spacing: 2px; text-transform: uppercase; display: flex; align-items: center; gap: 8px; }
+  #status i { width: 8px; height: 8px; border-radius: 50%; background: var(--c); box-shadow: 0 0 10px var(--c); }
+  #log { left: 26px; bottom: 26px; width: min(520px, 42vw); font-size: 13px; line-height: 1.5; }
+  #log div { margin-top: 6px; opacity: .9; }
+  #log .user { color: #9fdbe4; } #log .user::before { content: "› "; opacity: .6; }
+  #log .assistant { color: var(--c); text-shadow: 0 0 6px rgba(62,240,255,.4); }
+  #log .err { color: #ff7a7a; }
+  #tool { left: 50%; transform: translateX(-50%); bottom: 34px; font-size: 12px; padding: 6px 12px; border: 1px solid rgba(62,240,255,.35);
+    border-radius: 14px; opacity: 0; transition: opacity .3s; background: rgba(7,20,25,.6); color: var(--amber); border-color: rgba(255,196,87,.4); }
+  #mic { position: fixed; right: 26px; bottom: 26px; width: 54px; height: 54px; border-radius: 14px; border: 0; cursor: pointer;
+    background: var(--c); box-shadow: 0 0 22px rgba(62,240,255,.6); display: grid; place-items: center; transition: .2s; }
+  #mic.off { background: #24434d; box-shadow: none; }
+  #mic svg { width: 24px; height: 24px; fill: #052027; }
+  #mic.off svg { fill: #8fb3bd; }
+  #hint { right: 90px; bottom: 44px; font-size: 11px; color: var(--dim); }
+  #say { position: fixed; left: 50%; bottom: 70px; transform: translateX(-50%); width: min(480px, 70vw); display: none;
+    background: rgba(7,20,25,.85); border: 1px solid rgba(62,240,255,.4); color: var(--c); padding: 10px 14px; border-radius: 10px; font: inherit; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="title" class="hud">J.A.R.V.I.S.</div>
+<div id="date" class="hud"></div>
+<div id="status" class="hud"><i></i><span id="st">connecting</span></div>
+<div id="log" class="hud"></div>
+<div id="tool" class="hud"></div>
+<div id="hint" class="hud">ctrl+alt+j · "/" to type</div>
+<button id="mic" title="Toggle mic"><svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg></button>
+<input id="say" placeholder="Type a command and press Enter…">
+<script>
+// ------------------------------------------------------------------ state
+const S = { mic: 0, out: 0, state: "connecting", micOn: true, mouse: {x: 0, y: 0} };
+const $ = id => document.getElementById(id);
+$("date").textContent = new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
+
+// ------------------------------------------------------------------ face landmarks (normalized, x:-1..1, y:-1.25..1.25 down)
+const P = [];
+function add(x, y, g = "skin", extra = {}) { P.push(Object.assign({ x, y, g, zb: 0 }, extra)); return P.length - 1; }
+function faceHalfWidth(y) { const t = y / 1.25; let w = Math.sqrt(Math.max(0, 1 - t * t)) * 0.95; if (y > 0) w *= 1 - 0.32 * t * t; return w; }
+const OUT = 30;
+for (let i = 0; i < OUT; i++) { const a = i / OUT * Math.PI * 2, y = -Math.cos(a) * 1.25, s = Math.sin(a);
+  add(Math.sign(s) * faceHalfWidth(y) * Math.min(1, Math.abs(s) * 1.6), y, "outline"); }
+const EYES = [];
+for (const side of [-1, 1]) {
+  const cx = 0.37 * side, cy = -0.12; EYES.push({ cx, cy, side, ring: [] });
+  for (let i = 0; i < 12; i++) { const a = i / 12 * Math.PI * 2; EYES.at(-1).ring.push(add(cx + Math.cos(a) * 0.16, cy + Math.sin(a) * 0.058, "eyeIn", { cx, cy, side })); }
+  for (let i = 0; i < 8; i++) { const a = i / 8 * Math.PI * 2 + 0.2; add(cx + Math.cos(a) * 0.27, cy + Math.sin(a) * 0.15, "eyeOut", { cx, cy, side }); }
+  for (let i = 0; i < 5; i++) { const t = i / 4 - 0.5; add(cx + t * 0.42, -0.36 - 0.06 * Math.cos(t * 2.4), "brow", { side, inner: Math.max(0, -t * side * 2) }); }
+}
+[[0, -0.1, .05], [0, 0.1, .12], [0, 0.3, .26], [-0.12, 0.34, .08], [0.12, 0.34, .08], [-0.06, 0.41, .1], [0.06, 0.41, .1], [0, 0.43, .14],
+ [-0.1, 0.12, .04], [0.1, 0.12, .04]].forEach(([x, y, z]) => add(x, y, "nose", { zb: z }));
+const MY = 0.68, MOUTH_IN_UP = [], MOUTH_IN_LOW = [];
+for (let i = 0; i <= 8; i++) { const t = i / 4 - 1; add(t * 0.33, MY - 0.035 * (1 - t * t), "lipUp", { t, zb: .03 }); }
+for (let i = 1; i < 8; i++) { const t = i / 4 - 1; add(t * 0.33, MY + 0.085 * (1 - t * t), "lipLow", { t, zb: .03 }); }
+for (let i = 1; i < 6; i++) { const t = i / 3 - 1; MOUTH_IN_UP.push(add(t * 0.26, MY + 0.016, "inUp", { t: t * .8, zb: .02 })); }
+for (let i = 1; i < 6; i++) { const t = i / 3 - 1; MOUTH_IN_LOW.push(add(t * 0.26, MY + 0.03, "inLow", { t: t * .8, zb: .02 })); }
+[[0, 1.0], [-0.22, 0.97], [0.22, 0.97], [0, 0.88]].forEach(([x, y]) => add(x, y, "chin"));
+const near = (x, y, d) => P.some(p => Math.hypot(p.x - x, p.y - y) < d);
+for (const ring of [0.78, 0.55, 0.3]) {
+  const n = 2 * Math.round(13 * ring);
+  for (let i = 0; i < n; i++) { const a = (i + 0.5) / n * Math.PI * 2, y = -Math.cos(a) * 1.25 * ring;
+    const x = Math.sign(Math.sin(a)) * faceHalfWidth(y) * ring * Math.min(1, Math.abs(Math.sin(a)) * 1.6);
+    if (!near(x, y, 0.13)) add(x, y); }
+}
+const N = P.length;
+P.forEach(p => { p.z = Math.sqrt(Math.max(0, 1 - (p.x / 1.05) ** 2 - (p.y / 1.5) ** 2)) * 0.55 + p.zb;
+  p.cheek = Math.max(0, 1 - Math.hypot(Math.abs(p.x) - 0.45, p.y - 0.3) / 0.25); });
+
+// ------------------------------------------------------------------ Delaunay (Bowyer–Watson)
+function delaunay(pts) {
+  const all = pts.map(p => ({ x: p.x, y: p.y })).concat([{ x: -20, y: -20 }, { x: 20, y: -20 }, { x: 0, y: 20 }]);
+  const n = pts.length;
+  function mk(a, b, c) { const A = all[a], B = all[b], C = all[c];
+    const d = 2 * (A.x * (B.y - C.y) + B.x * (C.y - A.y) + C.x * (A.y - B.y));
+    const ux = ((A.x ** 2 + A.y ** 2) * (B.y - C.y) + (B.x ** 2 + B.y ** 2) * (C.y - A.y) + (C.x ** 2 + C.y ** 2) * (A.y - B.y)) / d;
+    const uy = ((A.x ** 2 + A.y ** 2) * (C.x - B.x) + (B.x ** 2 + B.y ** 2) * (A.x - C.x) + (C.x ** 2 + C.y ** 2) * (B.x - A.x)) / d;
+    return { v: [a, b, c], cx: ux, cy: uy, r2: (A.x - ux) ** 2 + (A.y - uy) ** 2 }; }
+  let tris = [mk(n, n + 1, n + 2)];
+  for (let i = 0; i < n; i++) {
+    const p = all[i], keep = [], edges = new Map();
+    for (const t of tris) {
+      if ((p.x - t.cx) ** 2 + (p.y - t.cy) ** 2 < t.r2) {
+        for (const [a, b] of [[t.v[0], t.v[1]], [t.v[1], t.v[2]], [t.v[2], t.v[0]]]) {
+          const k = a < b ? a + "," + b : b + "," + a; edges.set(k, edges.has(k) ? null : [a, b]); }
+      } else keep.push(t);
+    }
+    for (const e of edges.values()) if (e) keep.push(mk(e[0], e[1], i));
+    tris = keep;
+  }
+  return tris.map(t => t.v).filter(v => v.every(k => k < n));
+}
+const isG = (gs, side) => v => v.every(k => gs.includes(P[k].g) && (side === undefined || P[k].side === side));
+const holes = [isG(["eyeIn"], -1), isG(["eyeIn"], 1), isG(["inUp", "inLow"])];
+const TRIS = delaunay(P).filter(v => !holes.some(h => h(v)));
+const EDGES = (() => { const m = new Map(); TRIS.forEach(([a, b, c]) => [[a, b], [b, c], [c, a]].forEach(([x, y]) => m.set(x < y ? x + "," + y : y + "," + x, [x, y]))); return [...m.values()]; })();
+const DUST = []; TRIS.forEach(t => { for (let i = 0; i < 7; i++) { let a = Math.random(), b = Math.random(); if (a + b > 1) { a = 1 - a; b = 1 - b; } DUST.push({ t, a, b, ph: Math.random() * 6.28 }); } });
+
+// ------------------------------------------------------------------ expressions
+// smile -1..1, brow -1..1 (raise), browIn 0..1 (furrow), eye 0..1.3 (openness), tilt (head roll), asym (one brow up)
+const EMO = {
+  neutral:   { smile: .12, brow: 0,   browIn: 0,  eye: 1,    tilt: 0,    asym: 0,  gx: 0,   gy: 0 },
+  listening: { smile: .18, brow: .3,  browIn: 0,  eye: 1.1,  tilt: .04,  asym: 0,  gx: 0,   gy: 0 },
+  happy:     { smile: .85, brow: .3,  browIn: 0,  eye: .82,  tilt: .03,  asym: 0,  gx: 0,   gy: 0 },
+  excited:   { smile: 1,   brow: .7,  browIn: 0,  eye: 1.2,  tilt: 0,    asym: 0,  gx: 0,   gy: 0 },
+  curious:   { smile: .15, brow: .55, browIn: 0,  eye: 1.15, tilt: .09,  asym: .5, gx: 0,   gy: 0 },
+  concerned: { smile: -.45,brow: .25, browIn: .8, eye: .95,  tilt: -.03, asym: 0,  gx: 0,   gy: .1 },
+  thinking:  { smile: 0,   brow: .15, browIn: .35,eye: .95,  tilt: -.06, asym: .3, gx: .45, gy: -.5 },
+  standby:   { smile: .1,  brow: -.05,browIn: 0,  eye: .6,   tilt: 0,    asym: 0,  gx: 0,   gy: .1 },
+  sleepy:    { smile: 0,   brow: -.25,browIn: 0,  eye: .3,   tilt: .05,  asym: 0,  gx: 0,   gy: .3 },
+};
+const E = Object.assign({ open: 0, wide: 0, blink: 1, sx: 0, sy: 0 }, EMO.neutral);
+let emotion = "neutral", emotionUntil = 0;
+function detectEmotion(text) {
+  const t = text.toLowerCase();
+  if (/\b(sorry|unfortunately|can't|cannot|couldn't|unable|error|failed|not found|problem|warning|careful)\b/.test(t)) return "concerned";
+  if (/\b(amazing|wow|fantastic|excellent|brilliant|congratulations)\b/.test(t)) return "excited";
+  if (/\?\s*$|\b(which one|would you like|do you want|shall i|are you sure|confirm)\b/.test(t)) return "curious";
+  if (/!|\b(done|great|sure|of course|glad|happy|awesome|nice|perfect|ready|welcome|enjoy|hello|hi)\b/.test(t)) return "happy";
+  return "neutral";
+}
+function setEmotion(e, holdMs = 4000) { emotion = e; emotionUntil = performance.now() + holdMs; }
+function baseEmotion() {
+  if (performance.now() < emotionUntil) return emotion;
+  return { muted: "sleepy", standby: "standby", working: "thinking", thinking: "thinking", connecting: "thinking", listening: S.mic > .08 ? "listening" : "listening" }[S.state] || "neutral";
+}
+// visemes: [open, wide]
+const VIS = [[1, 0], [.55, .65], [.7, -.55], [.35, .3], [.15, -.2], [.85, .25]];
+let vis = VIS[0], visT = 0, blinkT = 2000, blinkPhase = 0, sacT = 0;
+
+// ------------------------------------------------------------------ render
+const cv = $("cv"), ctx = cv.getContext("2d"); let W, H, DPR;
+function resize() { DPR = devicePixelRatio || 1; W = innerWidth; H = innerHeight; cv.width = W * DPR; cv.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0); }
+addEventListener("resize", resize); resize();
+addEventListener("mousemove", e => { S.mouse.x = e.clientX / W - .5; S.mouse.y = e.clientY / H - .5; });
+
+let glow = 0, spin = 0, last = 0;
+const scr = new Array(N), lerp = (a, b, t) => a + (b - a) * t;
+function frame(ts) {
+  const t = ts / 1000, dt = Math.min(50, ts - last); last = ts;
+
+  // --- lip sync: amplitude drives openness, a viseme picked per syllable shapes it
+  const talking = S.out > 0.03;
+  visT -= dt;
+  if (talking && visT <= 0) { vis = VIS[(Math.random() * VIS.length) | 0]; visT = 70 + Math.random() * 90; }
+  const amp = Math.min(1, Math.sqrt(S.out) * 1.6);
+  E.open = lerp(E.open, talking ? amp * vis[0] : 0, 0.45);
+  E.wide = lerp(E.wide, talking ? vis[1] * Math.min(1, amp * 1.5) : 0, 0.3);
+
+  // --- emotion targets
+  const tgt = EMO[baseEmotion()];
+  for (const k of ["smile", "brow", "browIn", "eye", "tilt", "asym", "gx", "gy"]) E[k] = lerp(E[k], tgt[k], 0.07);
+  if (talking) E.brow += amp * 0.015; // brows bob with emphasis
+
+  // --- blink (sometimes double) + saccades
+  blinkT -= dt;
+  if (blinkT <= 0 && blinkPhase === 0) blinkPhase = 1;
+  if (blinkPhase) { blinkPhase += dt / 140; E.blink = Math.abs(Math.cos(Math.min(1, blinkPhase - 1) * Math.PI));
+    if (blinkPhase >= 2) { blinkPhase = 0; E.blink = 1; blinkT = Math.random() < .2 ? 180 : 2200 + Math.random() * 3500; } }
+  sacT -= dt;
+  if (sacT <= 0) { E.sx = (Math.random() - .5) * .25; E.sy = (Math.random() - .5) * .15; sacT = 600 + Math.random() * 1800; }
+
+  glow = lerp(glow, Math.max(S.out * 1.4, S.state === "listening" ? S.mic * 1.6 : 0), 0.2);
+  const busy = S.state === "working" || S.state === "connecting";
+  spin += busy ? 0.03 : 0.006;
+  const col = S.state === "muted" ? [110, 140, 150] : (S.state === "working" || S.state === "thinking") ? [255, 196, 87] : S.state === "standby" ? [40, 170, 190] : [62, 240, 255];
+  const rgba = a => `rgba(${col[0]},${col[1]},${col[2]},${a})`;
+
+  ctx.clearRect(0, 0, W, H);
+  const cx = W * 0.5, cy = H * 0.5, scale = Math.min(W, H) * 0.25;
+  const yaw = Math.sin(t * 0.45) * 0.1 + S.mouse.x * 0.5 + E.gx * 0.15;
+  const pitch = Math.sin(t * 0.33) * 0.04 + S.mouse.y * 0.3 + E.gy * 0.1 + E.open * 0.05; // nods while talking
+  const roll = E.tilt + Math.sin(t * 0.27) * 0.015;
+  const cyw = Math.cos(yaw), syw = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch), cr = Math.cos(roll), sr = Math.sin(roll);
+  const breathe = 1 + Math.sin(t * 1.4) * 0.006 + glow * 0.012;
+  const eyeOpen = Math.max(0.04, E.eye * E.blink);
+
+  for (let i = 0; i < N; i++) {
+    const p = P[i]; let x = p.x, y = p.y;
+    switch (p.g) {
+      case "eyeIn": {
+        const up = y < p.cy, k = up ? eyeOpen : 0.4 + 0.6 * eyeOpen - Math.max(0, E.smile) * 0.35;
+        y = p.cy + (y - p.cy) * k - (up ? 0 : 0); break; }
+      case "eyeOut": if (y < p.cy) y -= E.brow * 0.04 + (1 - E.blink) * 0.015; else y -= Math.max(0, E.smile) * 0.03; break;
+      case "brow": y -= E.brow * 0.11 + (p.side > 0 ? E.asym * 0.07 : 0); y += E.browIn * 0.09 * p.inner; break;
+      case "lipUp": x *= 1 + E.wide * 0.16; y -= E.smile * 0.11 * p.t * p.t + E.open * 0.025 * (1 - p.t * p.t); break;
+      case "lipLow": x *= 1 + E.wide * 0.16; y -= E.smile * 0.09 * p.t * p.t; y += E.open * 0.15 * (1 - p.t * p.t * .6) + Math.max(0, E.smile) * .02 * (1 - p.t * p.t); break;
+      case "inUp": x *= 1 + E.wide * 0.16; y -= E.smile * 0.08 * p.t * p.t + E.open * 0.03 * (1 - p.t * p.t); break;
+      case "inLow": x *= 1 + E.wide * 0.16; y -= E.smile * 0.07 * p.t * p.t; y += E.open * 0.17 * (1 - p.t * p.t * .5); break;
+      case "chin": y += E.open * 0.07; break;
+    }
+    if (p.cheek) y -= Math.max(0, E.smile) * 0.035 * p.cheek;
+    const z = p.z;
+    const xr = x * cr - y * sr, yr = x * sr + y * cr;
+    const x1 = xr * cyw + z * syw, z1 = -xr * syw + z * cyw;
+    const y1 = yr * cp - z1 * sp, z2 = yr * sp + z1 * cp;
+    const f = 3.2 / (3.2 - z2) * breathe;
+    scr[i] = [cx + x1 * scale * f, cy + y1 * scale * f, z2];
+  }
+
+  // rings
+  ctx.lineWidth = 1; ctx.strokeStyle = rgba(0.18 + glow * 0.4);
+  ctx.beginPath(); ctx.ellipse(cx, cy, scale * 1.18, scale * 1.48, 0, 0, 7); ctx.stroke();
+  ctx.strokeStyle = rgba(0.35 + glow * 0.5); ctx.lineWidth = 2;
+  for (let k = 0; k < 3; k++) { const a0 = spin * (k % 2 ? -1 : 1) + k * 2.1;
+    ctx.beginPath(); ctx.ellipse(cx, cy, scale * (1.26 + k * 0.05), scale * (1.56 + k * 0.05), 0, a0, a0 + 0.5 + glow); ctx.stroke(); }
+
+  // dust
+  for (const d of DUST) {
+    const [A, B, C] = d.t.map(k => scr[k]); const c = 1 - d.a - d.b;
+    ctx.fillStyle = rgba((0.18 + 0.25 * Math.sin(t * 2 + d.ph) ** 2) * (0.6 + glow));
+    ctx.fillRect(A[0] * d.a + B[0] * d.b + C[0] * c, A[1] * d.a + B[1] * d.b + C[1] * c, 1.3, 1.3);
+  }
+
+  // mouth cavity (dark, with faint inner glow when talking)
+  const poly = idx => { ctx.moveTo(scr[idx[0]][0], scr[idx[0]][1]); idx.slice(1).forEach(k => ctx.lineTo(scr[k][0], scr[k][1])); };
+  ctx.beginPath(); poly([...MOUTH_IN_UP, ...[...MOUTH_IN_LOW].reverse()]); ctx.closePath();
+  ctx.fillStyle = `rgba(2,10,13,${0.6 + E.open * 0.4})`; ctx.fill();
+  ctx.fillStyle = rgba(E.open * 0.25); ctx.fill();
+
+  // mesh
+  ctx.save();
+  ctx.shadowColor = rgba(0.9); ctx.shadowBlur = 8 + glow * 18;
+  ctx.strokeStyle = rgba(0.55 + glow * 0.45); ctx.lineWidth = 1.1 + glow * 0.6;
+  ctx.beginPath();
+  for (const [a, b] of EDGES) { ctx.moveTo(scr[a][0], scr[a][1]); ctx.lineTo(scr[b][0], scr[b][1]); }
+  ctx.stroke();
+  ctx.fillStyle = rgba(0.95);
+  for (let i = 0; i < N; i++) { ctx.beginPath(); ctx.arc(scr[i][0], scr[i][1], 1.5 + glow, 0, 7); ctx.fill(); }
+  // eyes: lid fill + iris that follows gaze, clipped by lids
+  for (const eye of EYES) {
+    ctx.save();
+    ctx.beginPath(); poly(eye.ring); ctx.closePath();
+    ctx.fillStyle = "rgba(2,10,13,.85)"; ctx.fill(); ctx.clip();
+    let ex = 0, ey = 0; eye.ring.forEach(k => { ex += scr[k][0]; ey += scr[k][1]; }); ex /= eye.ring.length; ey /= eye.ring.length;
+    const gx = (E.gx + E.sx + S.mouse.x * .6) * scale * 0.07, gy = (E.gy + E.sy + S.mouse.y * .4) * scale * 0.03;
+    const r = scale * 0.045;
+    ctx.beginPath(); ctx.arc(ex + gx, ey + gy, r, 0, 7); ctx.fillStyle = rgba(0.35 + glow * 0.3); ctx.fill();
+    ctx.beginPath(); ctx.arc(ex + gx, ey + gy, r * 0.45, 0, 7); ctx.fillStyle = rgba(1); ctx.fill();
+    ctx.restore();
+  }
+  ctx.restore();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ------------------------------------------------------------------ socket
+let ws, lastRole = null, lastEl = null;
+function log(role, text, partial) {
+  const box = $("log");
+  if (partial && lastRole === role && lastEl) { lastEl.textContent = text; return; }
+  const el = document.createElement("div"); el.className = role; el.textContent = text; box.appendChild(el);
+  lastRole = role; lastEl = el; while (box.children.length > 5) box.firstChild.remove();
+}
+function setState(s) {
+  S.state = s; $("st").textContent = s;
+  S.micOn = s !== "muted"; $("mic").classList.toggle("off", !S.micOn);
+  const c = s === "muted" ? "#6e8c96" : (s === "working" || s === "thinking") ? "#ffc457" : "#3ef0ff";
+  $("st").textContent = s === "standby" ? 'say "hey jarvis"' : s;
+  document.querySelector("#status i").style.background = c; document.querySelector("#status i").style.boxShadow = `0 0 10px ${c}`;
+}
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = e => { const m = JSON.parse(e.data);
+    if (m.type === "hello") { $("title").textContent = m.name.toUpperCase().split("").join(".") + "."; document.title = m.name; }
+    else if (m.type === "mic") S.mic = m.level;
+    else if (m.type === "out") S.out = m.level;
+    else if (m.type === "state") setState(m.state);
+    else if (m.type === "transcript") { if (m.role === "assistant") setEmotion(detectEmotion(m.text), 6000); if (m.role === "user" && lastRole !== "user") lastEl = null; log(m.role, m.text, m.partial); if (!m.partial) lastRole = null; }
+    else if (m.type === "tool") { const el = $("tool"); el.textContent = `⚙ ${m.name}(${Object.values(m.args || {}).join(", ")})`; el.style.opacity = 1; clearTimeout(el._t); el._t = setTimeout(() => el.style.opacity = 0, 2500); }
+    else if (m.type === "turn_end") { lastRole = null; if (emotion !== "neutral") emotionUntil = performance.now() + 1800; }
+    else if (m.type === "error") { log("err", "⚠ " + m.text); setEmotion("concerned", 3000); }
+  };
+  ws.onclose = () => { setState("connecting"); setTimeout(connect, 1000); };
+}
+connect();
+$("mic").onclick = () => ws.send(JSON.stringify({ type: "toggle_mic" }));
+const say = $("say");
+addEventListener("keydown", e => { if (e.key === "/" && document.activeElement !== say) { e.preventDefault(); say.style.display = "block"; say.focus(); }
+  if (e.key === "Escape") { say.style.display = "none"; say.blur(); } });
+say.addEventListener("keydown", e => { if (e.key === "Enter" && say.value.trim()) {
+  ws.send(JSON.stringify({ type: "text", text: say.value.trim() })); log("user", say.value.trim()); lastRole = null; say.value = ""; say.style.display = "none"; } });
+</script>
+</body>
+</html>
